@@ -21,9 +21,9 @@ from ocs_ci.ocs.exceptions import (
     UnavailableBuildException
 )
 from concurrent.futures import ThreadPoolExecutor
-from ocs_ci.ocs import constants, defaults, ocp, node
+from ocs_ci.ocs import constants, defaults, ocp, node, machine, cluster
 from ocs_ci.utility import templating
-from ocs_ci.ocs.resources import pod, pvc
+from ocs_ci.ocs.resources import pod, pvc, storage_cluster
 from ocs_ci.ocs.resources.ocs import OCS
 from ocs_ci.ocs.exceptions import CommandFailed, ResourceWrongStatusException
 from ocs_ci.utility.retry import retry
@@ -2056,3 +2056,62 @@ def modify_osd_replica_count(resource_name, replica_count):
     params = f'{{"spec": {{"replicas": {replica_count}}}}}'
     resource_name = '-'.join(resource_name.split('-')[0:4])
     return ocp_obj.patch(resource_name=resource_name, params=params)
+
+
+def check_required_osd_count(total_osd_nos=3):
+    """
+    Function to check required OSD count and if count is less add OSDs
+
+    Args:
+        total_osd_nos (int): OSD count per node.
+
+    Returns:
+        cluster_total_osd_count (int): Total OSD count of overall cluster.
+
+    """
+    # Make sure setup has required number of OSDs
+    actual_osd_count = cluster.count_cluster_osd()
+    ocs_nodes = node.get_typed_nodes(node_type='worker')
+    expected_osd_count = len(ocs_nodes) * total_osd_nos
+    if actual_osd_count == expected_osd_count:
+        logging.info(f"Setup has OSD count as per OCS workers")
+    else:
+        storage_cluster.add_capacity(int((expected_osd_count - actual_osd_count)/3))
+        logging.info(f"Now setup has expected osd count {expected_osd_count}")
+    return cluster.count_cluster_osd()
+
+
+def add_worker_based_on_cpu_utilization(
+    machineset_name, node_count, expected_percent, role_type
+):
+    """
+    Function to evaluate CPU utilization of nodes and add node if required.
+
+    Args:
+        machineset_name (str): Machineset_name to add more nodes if required.
+        node_count (int): Additional nodes to be added
+        expected_percent (int): Expected utilization precent
+        role_type (str): To add type to the nodes getting added
+
+    Returns:
+        bool: True if Nodes gets added, else false.
+
+    """
+    # Check for CPU utilization on each nodes
+    app_nodes = node.get_typed_nodes(node_type=role_type)
+    uti_dict = node.get_node_resource_utilization(node_type=role_type)
+    uti_high_nodes, uti_less_nodes = ([] for i in range(2))
+    for node_obj in app_nodes:
+        utilization_percent = uti_dict[f"{node_obj.name}"]['memory']
+        if utilization_percent > expected_percent:
+            uti_high_nodes.append(node_obj.name)
+        else:
+            uti_less_nodes.append(node_obj.name)
+    if len(uti_less_nodes) < 1:
+        count = machine.get_replica_count(machine_set=machineset_name)
+        machine.add_node(machine_set=machineset_name, count=(count + node_count))
+        machine.wait_for_new_node_to_be_ready(machineset_name)
+        return True
+    else:
+        logging.info("Enough resource available for more pod creation")
+        return False
