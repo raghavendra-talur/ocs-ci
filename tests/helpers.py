@@ -11,6 +11,7 @@ import tempfile
 import time
 import yaml
 import threading
+import random
 
 from ocs_ci.ocs.ocp import OCP
 
@@ -2076,7 +2077,7 @@ def check_required_osd_count(total_osd_nos=3):
     if actual_osd_count == expected_osd_count:
         logging.info(f"Setup has OSD count as per OCS workers")
     else:
-        storage_cluster.add_capacity(int((expected_osd_count - actual_osd_count)/3))
+        storage_cluster.add_capacity(int((expected_osd_count - actual_osd_count) / 3))
         logging.info(f"Now setup has expected osd count {expected_osd_count}")
     return cluster.count_cluster_osd()
 
@@ -2115,3 +2116,144 @@ def add_worker_based_on_cpu_utilization(
     else:
         logging.info("Enough resource available for more pod creation")
         return False
+
+
+def suggest_io_size_from_cls_usage(custom_size_dict=None):
+    """
+    Function to check cls capacity suggest IO write to cluster
+
+    Args:
+        custom_size_dict (dict): Dictionary of size param to be used during IO run.
+            eg: size_dict = {'usage_below_60': '2G', 'usage_60_70': '512M',
+            'usage_70_80': '10M', 'usage_80_85': '512K', 'usage_above_85': '10K'}
+        WARN: Make sure dict key is same as above example.
+
+    Returns:
+        size (str): IO size to be considered for cluster env
+
+    """
+    osd_dict = cluster.get_osd_utilization()
+    if custom_size_dict:
+        size_dict = custom_size_dict
+    else:
+        size_dict = {
+            'usage_below_60': '2G', 'usage_60_70': '512M', 'usage_70_80': '10M',
+            'usage_80_85': '512K', 'usage_above_85': '10K'
+        }
+    temp = 0
+    for k, v in osd_dict.items():
+        if temp <= v:
+            temp = v
+    if temp <= 60:
+        size = size_dict['usage_below_60']
+    elif 60 < temp <= 70:
+        size = size_dict['usage_60_70']
+    elif 70 < temp <= 80:
+        size = size_dict['usage_70_80']
+    elif 80 < temp <= 85:
+        size = size_dict['usage_80_85']
+    else:
+        size = size_dict['usage_above_85']
+        logging.warn(f"One of the OSD is near full {temp}% utilized")
+    return size
+
+
+def create_multi_pvc_pod(
+    namespace, rbd_sc_obj, cephfs_sc_obj, pvc_pod_count=5, pvc_size=f"{random.randrange(5, 105, 5)}Gi",
+    pod_dict_path=None, sa_name=None, dc_deployment=False, fio_rate=None, start_io=False,
+    fio_size='1G', fio_runtime=60, node_selector=None
+):
+    """
+    Function to create PVC of different type and attach them to PODs and start IO.
+
+    rbd_sc_obj=f"{config.ENV_DATA['storage_cluster_name']}-{constants.DEFAULT_STORAGECLASS_RBD}",
+    cephfs_sc_obj=f"{config.ENV_DATA['storage_cluster_name']}-{constants.DEFAULT_STORAGECLASS_CEPHFS}",
+
+    Args:
+        namespace (str): The namespace for creating pod
+        rbd_sc_obj (obj_dict): rbd storageclass object
+        cephfs_sc_obj (obj_dict): cephfs storageclass object
+        pvc_pod_count (int): Number of PVC-POD to be created per PVC type
+            eg: If 2 then 8 PVC+POD will be created with 2 each of 4 PVC types
+        pvc_size (int): PVC size to be created
+        pod_dict_path (str): pod_dict_path for yaml
+        sa_name (str): sa_name for providing permission
+        dc_deployment (bool): Either DC deployment or not
+        fio_rate (str): fio rate param for IO execution
+        start_io (bool): True to start IO and else False
+        fio_size (str): fio size param for IO execution
+        fio_runtime (int): fio runtime param for IO execution
+        node_selector (dict): dict of key-value pair to be used for nodeSelector field
+            eg: {'nodetype': 'app-pod'}
+
+    Returns:
+        all_pod_obj (obj): Objs of all the PODs created
+        all_pvc_obj (obj): Objs of all the PVCs created
+
+    """
+    logging.info(f"Create {pvc_pod_count} PVCs and PODs")
+    cephfs_pvcs = create_multiple_pvc_parallel(
+        cephfs_sc_obj, namespace, pvc_pod_count, pvc_size,
+        access_modes=[constants.ACCESS_MODE_RWO, constants.ACCESS_MODE_RWX]
+    )
+    rbd_pvcs = create_multiple_pvc_parallel(
+        rbd_sc_obj, namespace, pvc_pod_count, pvc_size,
+        access_modes=[constants.ACCESS_MODE_RWO, constants.ACCESS_MODE_RWX]
+    )
+    # Appending all the pvc_obj and pod_obj to list
+    all_pvc_obj, all_pod_obj = ([] for i in range(2))
+    all_pvc_obj.extend(cephfs_pvcs + rbd_pvcs)
+
+    # Create pods with above pvc list
+    cephfs_pods = create_pods_parallel(
+        cephfs_pvcs, namespace, constants.CEPHFS_INTERFACE,
+        pod_dict_path=pod_dict_path, sa_name=sa_name, dc_deployment=dc_deployment,
+        node_selector=node_selector
+    )
+    rbd_rwo_pvc, rbd_rwx_pvc = ([] for i in range(2))
+    for pvc_obj in rbd_pvcs:
+        if pvc_obj.get_pvc_access_mode == constants.ACCESS_MODE_RWX:
+            rbd_rwx_pvc.append(pvc_obj)
+        else:
+            rbd_rwo_pvc.append(pvc_obj)
+    rbd_rwo_pods = create_pods_parallel(
+        rbd_rwo_pvc, namespace, constants.CEPHBLOCKPOOL,
+        pod_dict_path=pod_dict_path, sa_name=sa_name, dc_deployment=dc_deployment,
+        node_selector=node_selector
+    )
+    rbd_rwx_pods = create_pods_parallel(
+        rbd_rwx_pvc, namespace, constants.CEPHBLOCKPOOL,
+        pod_dict_path=pod_dict_path, sa_name=sa_name, dc_deployment=dc_deployment,
+        raw_block_pv=True, node_selector=node_selector
+    )
+    temp_pod_objs = list()
+    temp_pod_objs.extend(cephfs_pods + rbd_rwo_pods)
+
+    # Appending all the pod_obj to list
+    all_pod_obj.extend(temp_pod_objs + rbd_rwx_pods)
+
+    # Start IO
+    if start_io:
+        threads = list()
+        for pod_obj in temp_pod_objs:
+            process = threading.Thread(
+                target=pod_obj.run_io, kwargs={
+                    'storage_type': 'fs', 'size': fio_size,
+                    'runtime': fio_runtime, 'rate': fio_rate
+                }
+            )
+            process.start()
+            threads.append(process)
+        for pod_obj in rbd_rwx_pods:
+            process = threading.Thread(
+                target=pod_obj.run_io, kwargs={
+                    'storage_type': 'block', 'size': fio_size,
+                    'runtime': fio_runtime, 'rate': fio_rate
+                }
+            )
+            process.start()
+            threads.append(process)
+        for process in threads:
+            process.join()
+
+    return all_pod_obj, all_pvc_obj
