@@ -2166,16 +2166,13 @@ def create_multi_pvc_pod(
     """
     Function to create PVC of different type and attach them to PODs and start IO.
 
-    rbd_sc_obj=f"{config.ENV_DATA['storage_cluster_name']}-{constants.DEFAULT_STORAGECLASS_RBD}",
-    cephfs_sc_obj=f"{config.ENV_DATA['storage_cluster_name']}-{constants.DEFAULT_STORAGECLASS_CEPHFS}",
-
     Args:
         namespace (str): The namespace for creating pod
         rbd_sc_obj (obj_dict): rbd storageclass object
         cephfs_sc_obj (obj_dict): cephfs storageclass object
         pvc_pod_count (int): Number of PVC-POD to be created per PVC type
             eg: If 2 then 8 PVC+POD will be created with 2 each of 4 PVC types
-        pvc_size (int): PVC size to be created
+        pvc_size (str): PVC size to be created
         pod_dict_path (str): pod_dict_path for yaml
         sa_name (str): sa_name for providing permission
         dc_deployment (bool): Either DC deployment or not
