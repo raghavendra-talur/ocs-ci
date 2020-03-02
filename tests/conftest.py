@@ -1,13 +1,17 @@
 import logging
 import os
 import tempfile
+from concurrent.futures.thread import ThreadPoolExecutor
 
 import pytest
 import threading
 from datetime import datetime
 import random
 from math import floor
-from concurrent.futures.thread import ThreadPoolExecutor
+from ocs_ci.ocs.resources.mcg_bucket import S3Bucket, OCBucket, CLIBucket
+
+from botocore.exceptions import ClientError
+import boto3
 
 from ocs_ci.utility.utils import TimeoutSampler, get_rook_repo
 from ocs_ci.ocs.exceptions import TimeoutExpiredError, CephHealthException
@@ -32,8 +36,7 @@ from ocs_ci.ocs.resources.mcg import MCG
 from ocs_ci.ocs.resources.ocs import OCS
 from ocs_ci.ocs.resources.pvc import PVC
 from ocs_ci.ocs.node import get_typed_worker_nodes
-from ocs_ci.ocs.resources.mcg_bucket import S3Bucket, OCBucket, CLIBucket
-
+from tests.helpers import create_unique_resource_name
 
 log = logging.getLogger(__name__)
 
@@ -53,53 +56,6 @@ def pytest_logger_config(logger_config):
     logger_config.set_log_option_default('')
     logger_config.split_by_outcome()
     logger_config.set_formatter_class(OCSLogFormatter)
-
-
-@pytest.fixture()
-def supported_configuration():
-    """
-    Check that cluster nodes have enough CPU and Memory as described in:
-    https://access.redhat.com/documentation/en-us/red_hat_openshift_container_storage/4.2/html-single/planning_your_deployment/index#infrastructure-requirements_rhocs
-    This fixture is intended as a prerequisite for tests or fixtures that
-    run flaky on configurations that don't meet minimal requirements.
-
-    Minimum requirements for each starting node (OSD+MON):
-        16 CPUs
-        64 GB memory
-    Last documentation check: 2020-02-21
-    """
-    min_cpu = 16
-    min_memory = 64 * 10**9
-
-    node_obj = ocp.OCP(kind=constants.NODE)
-    log.info('Checking if system meets minimal requirements')
-    nodes = node_obj.get(selector=constants.WORKER_LABEL).get('items')
-    log.info(
-        f"Checking following nodes with worker selector (assuming that "
-        f"this is ran in CI and there are no worker nodes without OCS):\n"
-        f"{[item.get('metadata').get('name') for item in nodes]}"
-    )
-    for node_info in nodes:
-        real_cpu = int(node_info['status']['capacity']['cpu'])
-        real_memory = node_info['status']['capacity']['memory']
-        if real_memory.endswith('Ki'):
-            real_memory = int(real_memory[0:-2]) * 2**10
-        elif real_memory.endswith('Mi'):
-            real_memory = int(real_memory[0:-2]) * 2**20
-        elif real_memory.endswith('Gi'):
-            real_memory = int(real_memory[0:-2]) * 2**30
-        elif real_memory.endswith('Ti'):
-            real_memory = int(real_memory[0:-2]) * 2**40
-        else:
-            real_memory = int(real_memory)
-
-        if (real_cpu < min_cpu or real_memory < min_memory):
-            pytest.xfail(
-                f"Node {node_info.get('metadata').get('name')} doesn't have "
-                f"minimum of required reasources for running the test:\n"
-                f"{min_cpu} CPU and {min_memory} Memory\nIt has:\n{real_cpu} "
-                f"CPU and {real_memory} Memory"
-            )
 
 
 @pytest.fixture(scope='class')
@@ -535,6 +491,7 @@ def pvc_factory_fixture(
         """
         pv_objs = []
 
+        logging.info("IN Finalizer of pvc_factory. Deleting PVCs....")
         # Get PV form PVC instances and delete PVCs
         for instance in instances:
             if not instance.is_deleted:
@@ -780,8 +737,10 @@ def dc_pod_factory(
         service_account=None,
         size=None,
         custom_data=None,
-        node_name=None,
         replica_count=1,
+        raw_block_pv=False,
+        sa_obj=None,
+        wait=True
     ):
         """
         Args:
@@ -794,7 +753,6 @@ def dc_pod_factory(
             custom_data (dict): If provided then Pod object is created
                 by using these data. Parameter `pvc` is not used but reference
                 is set if provided.
-            node_name (str): The name of specific node to schedule the pod
             replica_count (int): Replica count for deployment config
         """
         if custom_data:
@@ -802,17 +760,18 @@ def dc_pod_factory(
         else:
 
             pvc = pvc or pvc_factory(interface=interface, size=size)
-            sa_obj = service_account_factory(project=pvc.project, service_account=service_account)
+            sa_obj = sa_obj or service_account_factory(project=pvc.project, service_account=service_account)
             dc_pod_obj = helpers.create_pod(
                 interface_type=interface, pvc_name=pvc.name, do_reload=False,
                 namespace=pvc.namespace, sa_name=sa_obj.name, dc_deployment=True,
-                replica_count=replica_count, node_name=node_name
+                replica_count=replica_count,raw_block_pv=raw_block_pv
             )
         instances.append(dc_pod_obj)
         log.info(dc_pod_obj.name)
-        helpers.wait_for_resource_state(
-            dc_pod_obj, constants.STATUS_RUNNING, timeout=180
-        )
+        if wait:
+            helpers.wait_for_resource_state(
+                dc_pod_obj, constants.STATUS_RUNNING, timeout=180
+            )
         dc_pod_obj.pvc = pvc
         return dc_pod_obj
 
@@ -866,7 +825,8 @@ def health_checker(request):
                     return
             except CephHealthException:
                 # skip because ceph is not in good health
-                pytest.skip("Ceph Health check failed")
+                pass
+                # pytest.skip("Ceph Health check failed")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -895,7 +855,7 @@ def cluster(request, log_cli_level):
         config.RUN['cli_params'].get('deploy')
         and config.DEPLOYMENT['force_download_client']
     )
-    get_openshift_client(force_download=force_download)
+    # get_openshift_client(force_download=force_download)
 
     if deploy:
         # Deploy cluster
