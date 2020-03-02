@@ -743,3 +743,42 @@ def validate_osd_utilization(osd_used=80):
             logger.warn(f"{osd} used value {value}")
 
     return _rc
+
+
+def validate_pg_balancer():
+    """
+    Validate either data is equally distributed to OSDs
+
+    Returns:
+        bool: True if pg balancer is active and osd data consumption
+              difference is <= 2% else False
+
+    """
+    # Check either PG balancer is active or not
+    ceph_cmd = "ceph balancer status"
+    ct_pod = pod.get_ceph_tools_pod()
+    output = ct_pod.exec_ceph_cmd(ceph_cmd=ceph_cmd)
+    if output['active']:
+        logging.info("PG balancer is active")
+    else:
+        logging.warn("PG balancer is not active")
+        return False
+
+    # Check OSD utilization with pg balancer is active
+    osd_dict = get_osd_utilization()
+    osd_less_uti_value = min(osd_dict.values())
+    osd_high_uti_value = max(osd_dict.values())
+    diff = osd_high_uti_value - osd_less_uti_value
+    # TODO: For now kept OSD difference as 2% but have to revisit this
+    if diff <= 2:
+        logging.info(
+            f"OSD data consumption difference is {diff}% "
+            f"between high and low utilized OSDs"
+        )
+        return True
+    else:
+        logging.warn(
+            f"OSD data consumption difference is {diff}% "
+            f"between high and low utilized OSDs"
+        )
+        return False
